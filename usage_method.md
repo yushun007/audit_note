@@ -146,6 +146,75 @@ audit 子系统还允许外部应用程序实时访问和使用 auditd,这是由
 
 
 插件示例:
+配置文件`/etc/audisp/plugins.d/test.conf`:
+```
+active = yes
+direction = out
+path=/home/yushun/test.sh
+type=always
+args=hello
+format=string
+```
+插件脚本示例：
+```
+#! /usr/bin/bash
+while(( 1 ))
+do
+    read name
+    echo "${name}" >> /home/log.txt
+done
+```
+脚本不停的读取标准输入，然后写入日志文件中。奇怪的地方是这里是从标准输入读取，和audispd有什么关系呢？
 
+**解释**：
+首先我们的插件是由audispd拉起而不是我们手动拉起的，在audispd创建了一个socket对之后，会将pair[0]重定向到标准输入中，然后创建子进程拉起插件，显然插件的标准输入就变成了socket对中的pair[0]，所以这里脚本从标准输入读取就是从sockt对的pair[0]中读取。，在审计信息从auditd传入audispd之后，audispd又将审计信息写入了socket对的pair[1]中，然后脚本就可以通过read从pair[0]中读取数据了。其实这里就是使用socket创建了一个父子进程间的通信管道。(这个可以在audispd.c中的`safe_exec()`函数中找到,先用`soketpair()`函数创建一对socket，然后使用`dup2()`函数重定向pair[0]到标准输入)
 
+这是由audispd拉起的插件程序，如果我们需要自己启动进程，然后audispd有数据我们接收处理即可。可以利用af_unix.conf来让我们自己启动插件然后接收审计信息：
+修改`/etc/auditsp/plugins.d/af_unix.conf`:
+```
+active = yes # 启用af_unix功能
+direction = out
+path = builtin_af_unix
+type = builtin
+args = 0640 /var/run/audispd_events
+format = string
+```
+然后重启auditd
 
+自定义插件示例：
+```C
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <sys/un.h>
+#include <unistd.h>
+
+int main(int argc,char** argv){
+    struct sockaddr_un server_addr;
+    char buff[1024]={0};
+    server_addr.sun_family = AF_UNIX;
+    //这里的路径就是af_unix.conf中的路径
+    strcpy(server_addr.sun_path,"/var/run/audispd_events");
+
+    int sock = socket(AF_UNIX,SOCK_STREAM,0);
+    if (sockfd < 0)
+        return -1;
+    
+    //本地通信连接到audisp启动的服务端
+    int result = connect(sockfd,(struct sockaddr*)&server_addr,sizeof(server_addr));
+    if(result < 0 ){
+        close(sockfd);
+        return -1;
+    }
+
+    while(1){
+        memset(buff,0,1024);
+        if(read(sockfd,buff,1024)>0){
+            printf("%s\n",buff);
+        }
+    }
+    return 0;
+}
+```
+这里的方式是建立一个本的af_unix通信，audispd会根据`af_unix.conf`建立一个af_unix本地通信服务端。我们只需要在建立一个客户端然后连接到服务端，等待消息即可。
